@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
     Get { key: String },
-    Set { key: String, value: Vec },
+    Set { key: String, value: Vec<u8> },
     Delete { key: String },
     Ping,
     Info,
@@ -11,7 +11,7 @@ pub enum Command {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Value(Option>),
+    Value(Option<Vec<u8>>),
     Ok,
     Error(String),
     Pong,
