@@ -463,6 +463,31 @@ Modulo Partitioning
 Consistent Hashing
 ```
 
+Phase 3 uses static client-side routing. Configure nodes with `CACHEX_NODES`:
+
+```text
+CACHEX_NODES=node-a=127.0.0.1:7001,node-b=127.0.0.1:7002,node-c=127.0.0.1:7003
+CACHEX_PARTITIONER=consistent
+cachex-cli
+```
+
+`CACHEX_PARTITIONER` accepts `consistent` (the default) or `modulo`. The
+client validates the complete topology at startup, including empty IDs,
+duplicate IDs, duplicate addresses, and invalid socket addresses. `GET`,
+`SET`, and `DELETE` are routed by key; servers remain unaware of the cluster.
+`PING` and `INFO` use the first configured node. Single-node behavior remains
+available through `CACHEX_ADDR` without setting `CACHEX_NODES`.
+
+Phase 3 intentionally opens and closes one TCP connection per command. It has
+no connection pool, retry, failover, or failure detection; connection reuse is
+reserved for a later performance comparison.
+
+When running multiple servers, give each instance a distinct identity and AOF:
+
+```text
+CACHEX_NODE_ID=node-a CACHEX_ADDR=127.0.0.1:7001 CACHEX_AOF_PATH=node-a.aof cachex-server
+```
+
 ## Phase 4 — Replication and Fault Tolerance
 
 Add:

@@ -1,16 +1,36 @@
 use std::io::{self, Write};
 
 use cachex_cli::{format_response, parse_command};
-use cachex_protocol::Response;
-use tokio::net::TcpStream;
+use cachex_client::{ClusterClient, Node, PartitionerKind, parse_nodes, partitioner_from_env};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("CACHEX_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let mut stream = TcpStream::connect(&addr).await?;
-    println!("Connected to CacheX at {}", addr);
+    let client = if let Ok(nodes) = std::env::var("CACHEX_NODES") {
+        let kind = partitioner_from_env(
+            &std::env::var("CACHEX_PARTITIONER").unwrap_or_else(|_| "consistent".into()),
+        )?;
+        ClusterClient::new(parse_nodes(&nodes)?, kind)?
+    } else {
+        ClusterClient::new(
+            vec![Node {
+                id: "node-1".into(),
+                address: addr.clone(),
+            }],
+            PartitionerKind::Modulo,
+        )?
+    };
+    println!(
+        "Connected to CacheX ({})",
+        client
+            .nodes()
+            .iter()
+            .map(|n| n.address.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     loop {
         print!("> ");
@@ -29,8 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match parse_command(input) {
             Some(command) => {
-                cachex_protocol::write_framed(&mut stream, &command).await?;
-                let response: Response = cachex_protocol::read_framed(&mut stream).await?;
+                let response = client.execute(command).await?;
                 println!("{}", format_response(&response));
             }
             None => {
@@ -52,4 +71,9 @@ fn print_usage() {
     println!("  PING");
     println!("  INFO");
     println!("  exit");
+    println!();
+    println!("Cluster mode:");
+    println!("  CACHEX_NODES=node-a=127.0.0.1:7001,node-b=127.0.0.1:7002");
+    println!("  CACHEX_PARTITIONER=consistent|modulo (default: consistent)");
+    println!("Single-node mode uses CACHEX_ADDR (default: 127.0.0.1:7000).");
 }

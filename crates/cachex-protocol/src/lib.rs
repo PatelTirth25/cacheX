@@ -4,13 +4,17 @@ use tokio::net::TcpStream;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Command {
-    Get { key: String },
+    Get {
+        key: String,
+    },
     Set {
         key: String,
         value: Vec<u8>,
         ttl_secs: Option<u64>,
     },
-    Delete { key: String },
+    Delete {
+        key: String,
+    },
     Ping,
     Info,
 }

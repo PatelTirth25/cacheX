@@ -1,9 +1,9 @@
 [package]
-name = "cachex-cli"
+name = "cachex-client"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 cachex-protocol = { path = "../cachex-protocol" }
-cachex-client = { path = "../cachex-client" }
 tokio = { workspace = true }
+

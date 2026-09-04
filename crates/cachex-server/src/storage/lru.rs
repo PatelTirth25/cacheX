@@ -26,7 +26,9 @@ impl LruList {
             prev: head,
             next: ptr::null_mut(),
         }));
-        unsafe { (*head).next = tail; }
+        unsafe {
+            (*head).next = tail;
+        }
 
         Self {
             head,
@@ -63,7 +65,9 @@ impl LruList {
     pub fn remove(&mut self, key: &str) {
         if let Some(node) = self.map.remove(key) {
             self.unlink(node);
-            unsafe { drop(Box::from_raw(node)); }
+            unsafe {
+                drop(Box::from_raw(node));
+            }
         }
     }
 
@@ -74,7 +78,9 @@ impl LruList {
         }
         self.unlink(node);
         let key = unsafe { (*node).key.clone() };
-        unsafe { drop(Box::from_raw(node)); }
+        unsafe {
+            drop(Box::from_raw(node));
+        }
         self.map.remove(&key);
         Some(key)
     }
@@ -105,7 +111,9 @@ impl Drop for LruList {
         let mut current = unsafe { (*self.head).next };
         while current != self.tail {
             let next = unsafe { (*current).next };
-            unsafe { drop(Box::from_raw(current)); }
+            unsafe {
+                drop(Box::from_raw(current));
+            }
             current = next;
         }
         unsafe {

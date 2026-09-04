@@ -1,4 +1,4 @@
-use cachex_protocol::{read_framed, write_framed, Command, Response};
+use cachex_protocol::{Command, Response, read_framed, write_framed};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
@@ -13,11 +13,14 @@ async fn command_serializes_and_roundtrips() {
     });
 
     let mut client = TcpStream::connect(&addr).await.unwrap();
-    write_framed(&mut client, &Command::Set {
-        key: "k".to_string(),
-        value: b"v".to_vec(),
-        ttl_secs: None,
-    })
+    write_framed(
+        &mut client,
+        &Command::Set {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -93,11 +96,14 @@ async fn framing_handles_large_payloads() {
 
     let big = vec![b'x'; 200_000];
     let mut client = TcpStream::connect(&addr).await.unwrap();
-    write_framed(&mut client, &Command::Set {
-        key: "big".to_string(),
-        value: big.clone(),
-        ttl_secs: None,
-    })
+    write_framed(
+        &mut client,
+        &Command::Set {
+            key: "big".to_string(),
+            value: big.clone(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use cachex_server::storage::{Store, Aof, AofEntry};
+use cachex_server::storage::{Aof, AofEntry, Store};
 
 fn test_store(capacity: usize) -> Store {
     Store::new(capacity, "test-node".to_string(), "127.0.0.1:1".to_string())
@@ -22,7 +22,11 @@ fn get_missing_key_returns_none() {
 #[test]
 fn get_after_eventual_expiry() {
     let mut store = test_store(100);
-    store.set("key".to_string(), b"value".to_vec(), Some(Duration::from_millis(1)));
+    store.set(
+        "key".to_string(),
+        b"value".to_vec(),
+        Some(Duration::from_millis(1)),
+    );
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(store.get("key"), None);
 }
@@ -88,7 +92,11 @@ fn aof_recovery_roundtrip() {
         let mut store = test_store(100);
         store.set_aof(Aof::open(path.to_str().unwrap()));
         store.set("k1".to_string(), b"v1".to_vec(), None);
-        store.set("k2".to_string(), b"v2".to_vec(), Some(Duration::from_secs(3600)));
+        store.set(
+            "k2".to_string(),
+            b"v2".to_vec(),
+            Some(Duration::from_secs(3600)),
+        );
         store.delete("k1");
     }
 

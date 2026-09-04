@@ -20,8 +20,11 @@ impl ServerHandle {
 
         // Isolate each server in its own temp dir so AOF state doesn't leak
         // across tests (all subprocesses would otherwise share cachex.aof).
-        let workdir = std::env::temp_dir()
-            .join(format!("cachex_test_server_{}_{}", std::process::id(), port));
+        let workdir = std::env::temp_dir().join(format!(
+            "cachex_test_server_{}_{}",
+            std::process::id(),
+            port
+        ));
         std::fs::create_dir_all(&workdir).expect("failed to create test workdir");
 
         let child = StdCommand::new(BIN)
@@ -97,22 +100,35 @@ async fn set_then_get_roundtrip() {
     let server = ServerHandle::start(100).await;
     let mut stream = TcpStream::connect(&server.addr).await.unwrap();
 
-    request(&mut stream, &Command::Set {
-        key: "name".to_string(),
-        value: b"Tirth".to_vec(),
-        ttl_secs: None,
-    })
+    request(
+        &mut stream,
+        &Command::Set {
+            key: "name".to_string(),
+            value: b"Tirth".to_vec(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 
-    let resp = request(&mut stream, &Command::Get { key: "name".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "name".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(Some(b"Tirth".to_vec())));
 
-    let resp = request(&mut stream, &Command::Get { key: "missing".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "missing".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(None));
 }
 
@@ -121,22 +137,35 @@ async fn delete_removes_value() {
     let server = ServerHandle::start(100).await;
     let mut stream = TcpStream::connect(&server.addr).await.unwrap();
 
-    request(&mut stream, &Command::Set {
-        key: "temp".to_string(),
-        value: b"x".to_vec(),
-        ttl_secs: None,
-    })
+    request(
+        &mut stream,
+        &Command::Set {
+            key: "temp".to_string(),
+            value: b"x".to_vec(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 
-    let resp = request(&mut stream, &Command::Delete { key: "temp".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Delete {
+            key: "temp".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert!(matches!(resp, Response::Ok));
 
-    let resp = request(&mut stream, &Command::Get { key: "temp".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "temp".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(None));
 }
 
@@ -145,24 +174,37 @@ async fn ttl_expires_key_over_tcp() {
     let server = ServerHandle::start(100).await;
     let mut stream = TcpStream::connect(&server.addr).await.unwrap();
 
-    request(&mut stream, &Command::Set {
-        key: "short".to_string(),
-        value: b"v".to_vec(),
-        ttl_secs: Some(1),
-    })
+    request(
+        &mut stream,
+        &Command::Set {
+            key: "short".to_string(),
+            value: b"v".to_vec(),
+            ttl_secs: Some(1),
+        },
+    )
     .await
     .unwrap();
 
-    let resp = request(&mut stream, &Command::Get { key: "short".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "short".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(Some(b"v".to_vec())));
 
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    let resp = request(&mut stream, &Command::Get { key: "short".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "short".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(None));
 }
 
@@ -171,11 +213,14 @@ async fn info_reports_metadata() {
     let server = ServerHandle::start(100).await;
     let mut stream = TcpStream::connect(&server.addr).await.unwrap();
 
-    request(&mut stream, &Command::Set {
-        key: "a".to_string(),
-        value: b"1".to_vec(),
-        ttl_secs: None,
-    })
+    request(
+        &mut stream,
+        &Command::Set {
+            key: "a".to_string(),
+            value: b"1".to_vec(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -201,28 +246,44 @@ async fn lru_evicts_over_tcp() {
     let mut stream = TcpStream::connect(&server.addr).await.unwrap();
 
     for (k, v) in [("a", "1"), ("b", "2")] {
-        request(&mut stream, &Command::Set {
-            key: k.to_string(),
-            value: v.as_bytes().to_vec(),
-            ttl_secs: None,
-        })
+        request(
+            &mut stream,
+            &Command::Set {
+                key: k.to_string(),
+                value: v.as_bytes().to_vec(),
+                ttl_secs: None,
+            },
+        )
         .await
         .unwrap();
     }
-    request(&mut stream, &Command::Get { key: "a".to_string() })
-        .await
-        .unwrap();
-    request(&mut stream, &Command::Set {
-        key: "c".to_string(),
-        value: b"3".to_vec(),
-        ttl_secs: None,
-    })
+    request(
+        &mut stream,
+        &Command::Get {
+            key: "a".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    request(
+        &mut stream,
+        &Command::Set {
+            key: "c".to_string(),
+            value: b"3".to_vec(),
+            ttl_secs: None,
+        },
+    )
     .await
     .unwrap();
 
-    let resp = request(&mut stream, &Command::Get { key: "b".to_string() })
-        .await
-        .unwrap();
+    let resp = request(
+        &mut stream,
+        &Command::Get {
+            key: "b".to_string(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(resp, Response::Value(None)); // b was LRU and got evicted
 }
 
@@ -238,18 +299,19 @@ async fn multiple_clients_concurrent_operations() {
             for j in 0..50 {
                 let key = format!("c{}:{}", i, j);
                 let val = format!("v{}", j);
-                let set = request(&mut stream, &Command::Set {
-                    key: key.clone(),
-                    value: val.as_bytes().to_vec(),
-                    ttl_secs: None,
-                })
+                let set = request(
+                    &mut stream,
+                    &Command::Set {
+                        key: key.clone(),
+                        value: val.as_bytes().to_vec(),
+                        ttl_secs: None,
+                    },
+                )
                 .await
                 .unwrap();
                 assert!(matches!(set, Response::Ok));
 
-                let get = request(&mut stream, &Command::Get { key })
-                    .await
-                    .unwrap();
+                let get = request(&mut stream, &Command::Get { key }).await.unwrap();
                 assert_eq!(get, Response::Value(Some(val.as_bytes().to_vec())));
             }
         }));

@@ -18,24 +18,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_CAPACITY);
+    let node_id = std::env::var("CACHEX_NODE_ID").unwrap_or_else(|_| DEFAULT_NODE_ID.to_string());
+    let aof_path = std::env::var("CACHEX_AOF_PATH").unwrap_or_else(|_| AOF_PATH.to_string());
 
     let store: SharedStore = Arc::new(Mutex::new(Store::recover(
-        AOF_PATH,
+        &aof_path,
         capacity,
-        DEFAULT_NODE_ID.to_string(),
+        node_id,
         addr.clone(),
     )));
 
     {
         let mut s = store.lock().await;
-        s.set_aof(Aof::open(AOF_PATH));
+        s.set_aof(Aof::open(&aof_path));
     }
 
     let listener = TcpListener::bind(&addr).await?;
-    println!(
-        "CacheX server running on {} (capacity: {})",
-        addr, capacity
-    );
+    println!("CacheX server running on {} (capacity: {})", addr, capacity);
 
     loop {
         let (stream, peer) = listener.accept().await?;

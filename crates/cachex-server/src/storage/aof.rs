@@ -61,7 +61,10 @@ impl Aof {
             offset += 4;
 
             if offset + len > data.len() {
-                eprintln!("AOF: truncated entry at offset {}, discarding rest", offset - 4);
+                eprintln!(
+                    "AOF: truncated entry at offset {}, discarding rest",
+                    offset - 4
+                );
                 break;
             }
 

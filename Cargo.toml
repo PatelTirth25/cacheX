@@ -2,6 +2,7 @@
 members = [
     "crates/cachex-protocol",
     "crates/cachex-server",
+    "crates/cachex-client",
     "crates/cachex-cli"
 ]
 resolver = "2"
