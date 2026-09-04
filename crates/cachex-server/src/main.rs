@@ -1,31 +1,49 @@
-mod storage;
-
 use std::sync::Arc;
-use std::time::Instant;
-use storage::{SharedStore, Store};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+
+use cachex_protocol::{Command, Response};
+use cachex_server::storage::{Aof, SharedStore, Store};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
+
+const DEFAULT_ADDR: &str = "127.0.0.1:7000";
+const DEFAULT_CAPACITY: usize = 10_000;
+const DEFAULT_NODE_ID: &str = "node-1";
+const AOF_PATH: &str = "cachex.aof";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:7000";
-    let listener = TcpListener::bind(addr).await?;
+    let addr = std::env::var("CACHEX_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+    let capacity: usize = std::env::var("CACHEX_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CAPACITY);
 
-    let store: SharedStore = Arc::new(RwLock::new(Store::new()));
-    let start_time = Instant::now();
+    let store: SharedStore = Arc::new(Mutex::new(Store::recover(
+        AOF_PATH,
+        capacity,
+        DEFAULT_NODE_ID.to_string(),
+        addr.clone(),
+    )));
 
-    println!("CacheX server running on {}", addr);
+    {
+        let mut s = store.lock().await;
+        s.set_aof(Aof::open(AOF_PATH));
+    }
+
+    let listener = TcpListener::bind(&addr).await?;
+    println!(
+        "CacheX server running on {} (capacity: {})",
+        addr, capacity
+    );
 
     loop {
-        let (stream, socket_addr) = listener.accept().await?;
-        println!("New connection from: {}", socket_addr);
+        let (stream, peer) = listener.accept().await?;
+        println!("New connection from: {}", peer);
 
-        let store_clone = Arc::clone(&store);
-        let start = start_time;
-
+        let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, store_clone, start).await {
+            if let Err(e) = handle_connection(stream, store).await {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -35,57 +53,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_connection(
     mut stream: TcpStream,
     store: SharedStore,
-    start_time: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await?;
-
-        let command: cachex_protocol::Command = bincode::deserialize(&payload)?;
-
-        let response = match command {
-            cachex_protocol::Command::Get { key } => {
-                let store = store.read().await;
-                cachex_protocol::Response::Value(store.get(&key))
-            }
-            cachex_protocol::Command::Set { key, value } => {
-                let mut store = store.write().await;
-                store.set(key, value);
-                cachex_protocol::Response::Ok
-            }
-            cachex_protocol::Command::Delete { key } => {
-                let mut store = store.write().await;
-                if store.delete(&key) {
-                    cachex_protocol::Response::Ok
-                } else {
-                    cachex_protocol::Response::Error("key not found".to_string())
-                }
-            }
-            cachex_protocol::Command::Ping => cachex_protocol::Response::Pong,
-            cachex_protocol::Command::Info => {
-                let store = store.read().await;
-                cachex_protocol::Response::Info {
-                    node_id: "node-1".to_string(),
-                    address: "127.0.0.1:7000".to_string(),
-                    keys: store.len(),
-                    uptime_secs: start_time.elapsed().as_secs(),
-                }
-            }
+        let command: Command = match cachex_protocol::read_framed(&mut stream).await {
+            Ok(cmd) => cmd,
+            Err(e) if e.to_string().contains("unexpected end of file") => break,
+            Err(e) => return Err(e),
         };
 
-        let resp_payload = bincode::serialize(&response)?;
-        let resp_len = (resp_payload.len() as u32).to_be_bytes();
-        stream.write_all(&resp_len).await?;
-        stream.write_all(&resp_payload).await?;
+        let response = execute(command, &store).await;
+        cachex_protocol::write_framed(&mut stream, &response).await?;
     }
 
     Ok(())
+}
+
+async fn execute(command: Command, store: &SharedStore) -> Response {
+    match command {
+        Command::Get { key } => {
+            let mut s = store.lock().await;
+            Response::Value(s.get(&key))
+        }
+        Command::Set {
+            key,
+            value,
+            ttl_secs,
+        } => {
+            let mut s = store.lock().await;
+            s.set(key, value, ttl_secs.map(Duration::from_secs));
+            Response::Ok
+        }
+        Command::Delete { key } => {
+            let mut s = store.lock().await;
+            if s.delete(&key) {
+                Response::Ok
+            } else {
+                Response::Error("key not found".to_string())
+            }
+        }
+        Command::Ping => Response::Pong,
+        Command::Info => {
+            let s = store.lock().await;
+            Response::Info {
+                node_id: s.node_id().to_string(),
+                address: s.address().to_string(),
+                keys: s.keys(),
+                memory_bytes: s.memory_bytes(),
+                uptime_secs: s.uptime_secs(),
+            }
+        }
+    }
 }
