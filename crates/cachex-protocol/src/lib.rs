@@ -17,6 +17,15 @@ pub enum Command {
     },
     Ping,
     Info,
+    ReplicateSet {
+        key: String,
+        value: Vec<u8>,
+        ttl_secs: Option<u64>,
+    },
+    ReplicateDelete {
+        key: String,
+    },
+    Heartbeat,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

@@ -463,16 +463,17 @@ Modulo Partitioning
 Consistent Hashing
 ```
 
-Phase 3 uses static client-side routing. Configure nodes with `CACHEX_NODES`:
+Phase 3 uses static client-side routing. The preferred command-line form is:
 
-```text
-CACHEX_NODES=node-a=127.0.0.1:7001,node-b=127.0.0.1:7002,node-c=127.0.0.1:7003
-CACHEX_PARTITIONER=consistent
-cachex-cli
+```powershell
+cargo run -p cachex-cli -- `
+  --nodes "node-a=127.0.0.1:7001,node-b=127.0.0.1:7002,node-c=127.0.0.1:7003" `
+  --partitioner consistent
 ```
 
-`CACHEX_PARTITIONER` accepts `consistent` (the default) or `modulo`. The
-client validates the complete topology at startup, including empty IDs,
+The equivalent environment variables remain supported. `--partitioner`
+accepts `consistent` (the default) or `modulo`. The client validates the
+complete topology at startup, including empty IDs,
 duplicate IDs, duplicate addresses, and invalid socket addresses. `GET`,
 `SET`, and `DELETE` are routed by key; servers remain unaware of the cluster.
 `PING` and `INFO` use the first configured node. Single-node behavior remains
@@ -482,11 +483,7 @@ Phase 3 intentionally opens and closes one TCP connection per command. It has
 no connection pool, retry, failover, or failure detection; connection reuse is
 reserved for a later performance comparison.
 
-When running multiple servers, give each instance a distinct identity and AOF:
-
-```text
-CACHEX_NODE_ID=node-a CACHEX_ADDR=127.0.0.1:7001 CACHEX_AOF_PATH=node-a.aof cachex-server
-```
+See [commands.md](commands.md) for the preferred command-line workflow.
 
 ## Phase 4 — Replication and Fault Tolerance
 
@@ -499,6 +496,18 @@ Heartbeats
 Failure Detection
 Basic Recovery / Rerouting
 ```
+
+Phase 4 uses the existing static topology. The preferred startup and manual
+testing commands are documented in [commands.md](commands.md). Environment
+variables remain supported for compatibility, but are no longer required.
+
+Mutations are written locally and sent to the replica using internal framed
+protocol commands. Replica application does not fan out again, preventing
+replication loops. Nodes exchange `Heartbeat` messages every second by
+default and log `SUSPECT`, `DEAD` (after three missed probes), and `RECOVERED`
+transitions. The client retries key operations against the replica candidates
+when the primary connection fails, providing basic rerouting during failure.
+Set `CACHEX_HEARTBEAT_INTERVAL_MS` to tune the probe interval.
 
 ## Phase 5 — Evaluation and Monitoring
 

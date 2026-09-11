@@ -4,6 +4,7 @@ use std::net::ToSocketAddrs;
 
 use cachex_protocol::{Command, Response, read_framed, write_framed};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, timeout};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
@@ -135,16 +136,28 @@ impl std::error::Error for ClientError {}
 pub struct ClusterClient {
     nodes: Vec<Node>,
     partitioner: Box<dyn Partitioner>,
+    replication_factor: usize,
 }
 
 impl ClusterClient {
     pub fn new(nodes: Vec<Node>, kind: PartitionerKind) -> Result<Self, ClientError> {
+        Self::new_with_replication_factor(nodes, kind, 1)
+    }
+    pub fn new_with_replication_factor(
+        nodes: Vec<Node>,
+        kind: PartitionerKind,
+        replication_factor: usize,
+    ) -> Result<Self, ClientError> {
         validate_nodes(&nodes)?;
         let partitioner: Box<dyn Partitioner> = match kind {
             PartitionerKind::Modulo => Box::new(ModuloPartitioner::new(&nodes)?),
             PartitionerKind::Consistent => Box::new(ConsistentHashPartitioner::new(&nodes)?),
         };
-        Ok(Self { nodes, partitioner })
+        Ok(Self {
+            replication_factor: replication_factor.clamp(1, 2).min(nodes.len()),
+            nodes,
+            partitioner,
+        })
     }
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
@@ -156,22 +169,54 @@ impl ClusterClient {
             .find(|node| node.id == node_id)
             .expect("partitioner returned an unknown node ID")
     }
+    pub fn replica_nodes_for_key(&self, key: &str, replication_factor: usize) -> Vec<&Node> {
+        let factor = replication_factor.clamp(1, self.nodes.len());
+        let primary_id = self.partitioner.node_id(key);
+        let primary_index = self.nodes.iter().position(|n| n.id == primary_id).unwrap();
+        (0..self.nodes.len())
+            .map(|offset| &self.nodes[(primary_index + offset) % self.nodes.len()])
+            .take(factor)
+            .collect()
+    }
     pub async fn execute(&self, command: Command) -> Result<Response, ClientError> {
-        let node = match &command {
+        let key = match &command {
             Command::Get { key } | Command::Set { key, .. } | Command::Delete { key } => {
-                self.node_for_key(key)
+                Some(key.as_str())
             }
-            Command::Ping | Command::Info => &self.nodes[0],
+            Command::Ping
+            | Command::Info
+            | Command::ReplicateSet { .. }
+            | Command::ReplicateDelete { .. }
+            | Command::Heartbeat => None,
         };
-        let mut stream = TcpStream::connect(&node.address)
-            .await
-            .map_err(ClientError::Io)?;
-        write_framed(&mut stream, &command)
-            .await
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        read_framed(&mut stream)
-            .await
-            .map_err(|e| ClientError::Protocol(e.to_string()))
+        let candidates: Vec<&Node> = match key {
+            Some(key) => self.replica_nodes_for_key(key, self.replication_factor),
+            None => vec![&self.nodes[0]],
+        };
+        let mut last_error = None;
+        for node in candidates {
+            let result = timeout(Duration::from_secs(2), async {
+                let mut stream = TcpStream::connect(&node.address).await?;
+                write_framed(&mut stream, &command)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                read_framed(&mut stream)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+            .await;
+            match result {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error)) => last_error = Some(ClientError::Io(error)),
+                Err(_) => {
+                    last_error = Some(ClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "request timed out",
+                    )))
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| ClientError::Protocol("no candidate nodes".into())))
     }
 }
 
@@ -330,5 +375,24 @@ mod tests {
                 assert_eq!(old, new);
             }
         }
+    }
+
+    #[test]
+    fn replication_candidates_are_primary_then_next_node() {
+        let client =
+            ClusterClient::new_with_replication_factor(nodes(3), PartitionerKind::Modulo, 2)
+                .unwrap();
+        let candidates = client.replica_nodes_for_key("key-1", 2);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], client.node_for_key("key-1"));
+        assert_ne!(candidates[0].id, candidates[1].id);
+    }
+
+    #[test]
+    fn replication_factor_is_bounded_by_cluster_size() {
+        let client =
+            ClusterClient::new_with_replication_factor(nodes(1), PartitionerKind::Modulo, 2)
+                .unwrap();
+        assert_eq!(client.replica_nodes_for_key("key", 2).len(), 1);
     }
 }

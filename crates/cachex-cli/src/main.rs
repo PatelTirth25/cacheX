@@ -7,12 +7,30 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::var("CACHEX_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    let client = if let Ok(nodes) = std::env::var("CACHEX_NODES") {
-        let kind = partitioner_from_env(
-            &std::env::var("CACHEX_PARTITIONER").unwrap_or_else(|_| "consistent".into()),
-        )?;
-        ClusterClient::new(parse_nodes(&nodes)?, kind)?
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return Ok(());
+    }
+    let addr = option(&args, "--addr", "CACHEX_ADDR", DEFAULT_ADDR);
+    let client = if let Some(nodes) = option_optional(&args, "--nodes", "CACHEX_NODES") {
+        let kind = partitioner_from_env(&option(
+            &args,
+            "--partitioner",
+            "CACHEX_PARTITIONER",
+            "consistent",
+        ))?;
+        ClusterClient::new_with_replication_factor(
+            parse_nodes(&nodes)?,
+            kind,
+            option(
+                &args,
+                "--replication-factor",
+                "CACHEX_REPLICATION_FACTOR",
+                "1",
+            )
+            .parse()?,
+        )?
     } else {
         ClusterClient::new(
             vec![Node {
@@ -62,6 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn option(args: &[String], flag: &str, env_name: &str, default: &str) -> String {
+    option_optional(args, flag, env_name).unwrap_or_else(|| default.to_string())
+}
+
+fn option_optional(args: &[String], flag: &str, env_name: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .or_else(|| std::env::var(env_name).ok())
+}
+
 fn print_usage() {
     println!("Usage:");
     println!("  GET <key>");
@@ -76,4 +105,10 @@ fn print_usage() {
     println!("  CACHEX_NODES=node-a=127.0.0.1:7001,node-b=127.0.0.1:7002");
     println!("  CACHEX_PARTITIONER=consistent|modulo (default: consistent)");
     println!("Single-node mode uses CACHEX_ADDR (default: 127.0.0.1:7000).");
+    println!();
+    println!("Command-line options:");
+    println!("  --addr <host:port>");
+    println!("  --nodes <id=addr,...>");
+    println!("  --partitioner <consistent|modulo>");
+    println!("  --replication-factor <1|2>");
 }

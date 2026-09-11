@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 cachex-protocol = { path = "../cachex-protocol" }
+cachex-client = { path = "../cachex-client" }
 tokio = { workspace = true }
 bincode = { workspace = true }
 serde = { workspace = true }
