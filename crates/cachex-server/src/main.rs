@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cachex_client::{ClusterClient, Node, parse_nodes, partitioner_from_env};
 use cachex_protocol::{Command, Response, read_framed, write_framed};
 use cachex_server::storage::{Aof, SharedStore, Store};
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -31,6 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .parse::<usize>()?;
     let node_id = option(&args, "--node-id", "CACHEX_NODE_ID", DEFAULT_NODE_ID);
     let aof_path = option(&args, "--aof-path", "CACHEX_AOF_PATH", AOF_PATH);
+    let dashboard_default = default_dashboard_addr(&addr);
+    let dashboard_addr = option(
+        &args,
+        "--dashboard-addr",
+        "CACHEX_DASHBOARD_ADDR",
+        &dashboard_default,
+    );
     let replication_factor = option(
         &args,
         "--replication-factor",
@@ -69,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
     store.lock().await.set_aof(Aof::open(&aof_path));
     let listener = TcpListener::bind(&addr).await?;
+    let dashboard_listener = TcpListener::bind(&dashboard_addr).await?;
     println!(
         "CacheX server running on {} (capacity: {}, replication factor: {})",
         addr, capacity, replication_factor
@@ -81,6 +92,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .parse::<u64>()?;
     spawn_heartbeat(Arc::clone(&topology), heartbeat_interval_ms);
+    println!("Dashboard API available at http://{}", dashboard_addr);
+    let dashboard_store = Arc::clone(&store);
+    let dashboard_topology = Arc::clone(&topology);
+    tokio::spawn(async move {
+        if let Err(error) = dashboard_loop(
+            dashboard_listener,
+            dashboard_store,
+            dashboard_topology,
+            replication_factor,
+        )
+        .await
+        {
+            eprintln!("Dashboard API stopped: {error}");
+        }
+    });
     loop {
         let (stream, peer) = listener.accept().await?;
         println!("New connection from: {}", peer);
@@ -96,6 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn option(args: &[String], flag: &str, env_name: &str, default: &str) -> String {
     option_optional(args, flag, env_name).unwrap_or_else(|| default.to_string())
+}
+
+fn default_dashboard_addr(cache_addr: &str) -> String {
+    cache_addr
+        .parse::<SocketAddr>()
+        .map(|address| format!("{}:{}", address.ip(), address.port().saturating_add(1000)))
+        .unwrap_or_else(|_| "127.0.0.1:8000".into())
 }
 
 fn option_optional(args: &[String], flag: &str, env_name: &str) -> Option<String> {
@@ -115,6 +148,199 @@ fn print_usage() {
     println!("  --replication-factor <1|2>");
     println!("  --capacity <number>");
     println!("  --heartbeat-interval-ms <ms>");
+    println!("  --dashboard-addr <host:port>");
+}
+
+async fn dashboard_loop(
+    listener: TcpListener,
+    store: SharedStore,
+    topology: Arc<ClusterClient>,
+    replication_factor: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let store = Arc::clone(&store);
+        let topology = Arc::clone(&topology);
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_dashboard_request(stream, store, topology, replication_factor).await
+            {
+                eprintln!("Dashboard request error: {error}");
+            }
+        });
+    }
+}
+
+async fn handle_dashboard_request(
+    mut stream: TcpStream,
+    store: SharedStore,
+    topology: Arc<ClusterClient>,
+    replication_factor: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = read_http_request(&mut stream).await?;
+    let mut lines = request.splitn(2, "\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let rest = lines.next().unwrap_or_default();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or_default();
+    let path = request_parts.next().unwrap_or_default();
+    let body = rest
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+
+    if method == "OPTIONS" {
+        write_http_response(&mut stream, 204, b"").await?;
+        return Ok(());
+    }
+
+    match (method, path) {
+        ("GET", "/api/health") => {
+            write_json_response(&mut stream, 200, &json!({"status": "ok"})).await?;
+        }
+        ("GET", "/api/overview") => {
+            let store = store.lock().await;
+            let nodes: Vec<_> = topology
+                .nodes()
+                .iter()
+                .map(|node| json!({"id": node.id, "address": node.address}))
+                .collect();
+            let overview = json!({
+                "node": {
+                    "id": store.node_id(),
+                    "address": store.address(),
+                    "keys": store.keys(),
+                    "memory_bytes": store.memory_bytes(),
+                    "uptime_secs": store.uptime_secs()
+                },
+                "nodes": nodes,
+                "replication_factor": replication_factor
+            });
+            write_json_response(&mut stream, 200, &overview).await?;
+        }
+        ("POST", "/api/command") => {
+            let payload: serde_json::Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    write_json_response(&mut stream, 400, &json!({"error": error.to_string()}))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let command = match dashboard_command(&payload) {
+                Ok(command) => command,
+                Err(error) => {
+                    write_json_response(&mut stream, 400, &json!({"error": error})).await?;
+                    return Ok(());
+                }
+            };
+            let response = execute(command, &store, &topology, replication_factor).await;
+            write_json_response(&mut stream, 200, &json!({"response": response})).await?;
+        }
+        _ => write_json_response(&mut stream, 404, &json!({"error": "not found"})).await?,
+    }
+    Ok(())
+}
+
+fn dashboard_command(payload: &serde_json::Value) -> Result<Command, String> {
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("operation is required")?;
+    let key = payload
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if key.is_empty() {
+        return Err("key is required".into());
+    }
+    match operation.to_ascii_lowercase().as_str() {
+        "get" => Ok(Command::Get { key }),
+        "delete" => Ok(Command::Delete { key }),
+        "set" => {
+            let value = payload
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("value is required")?
+                .as_bytes()
+                .to_vec();
+            let ttl_secs = payload.get("ttl_secs").and_then(serde_json::Value::as_u64);
+            Ok(Command::Set {
+                key,
+                value,
+                ttl_secs,
+            })
+        }
+        _ => Err("operation must be GET, SET, or DELETE".into()),
+    }
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<String, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end;
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(String::from_utf8_lossy(&buffer).into_owned());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = end + 4;
+            break;
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err("HTTP request headers too large".into());
+        }
+    }
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+async fn write_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::to_vec(value)?;
+    write_http_response(stream, status, &body).await
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    Ok(())
 }
 
 fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64) {

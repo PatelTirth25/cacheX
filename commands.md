@@ -16,7 +16,7 @@ cargo test
 Terminal 1:
 
 ```powershell
-cargo run -p cachex-server -- --node-id node-1 --addr 127.0.0.1:7000 --aof-path single-node.aof
+cargo run -p cachex-server -- --node-id node-1 --addr 127.0.0.1:7000 --aof-path single-node.aof --dashboard-addr 127.0.0.1:7600
 ```
 
 Terminal 2:
@@ -52,6 +52,7 @@ cargo run -p cachex-server -- `
   --node-id node-a `
   --addr 127.0.0.1:7001 `
   --aof-path node-a.aof `
+  --dashboard-addr 127.0.0.1:7601 `
   --nodes "node-a=127.0.0.1:7001,node-b=127.0.0.1:7002" `
   --partitioner consistent `
   --replication-factor 2
@@ -64,6 +65,7 @@ cargo run -p cachex-server -- `
   --node-id node-b `
   --addr 127.0.0.1:7002 `
   --aof-path node-b.aof `
+  --dashboard-addr 127.0.0.1:7602 `
   --nodes "node-a=127.0.0.1:7001,node-b=127.0.0.1:7002" `
   --partitioner consistent `
   --replication-factor 2
@@ -87,6 +89,22 @@ GET replicated
 SET counter one
 GET counter
 ```
+
+## React dashboard
+
+From the `dashboard` directory, install the frontend dependencies once and
+start the Vite development server:
+
+```powershell
+cd dashboard
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. For the two-node commands above, enter
+`http://127.0.0.1:7601` in the dashboard API field and click **Connect**.
+The dashboard reads live overview data from the selected node and can issue
+GET, SET, and DELETE operations through `/api/command`.
 
 ## Failure detection and rerouting
 

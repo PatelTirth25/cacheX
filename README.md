@@ -511,15 +511,14 @@ Set `CACHEX_HEARTBEAT_INTERVAL_MS` to tune the probe interval.
 
 ## Phase 5 — Evaluation and Monitoring
 
-Add:
+The first Phase 5 deliverable is implemented: a React/Vite monitoring
+dashboard with a lightweight HTTP/JSON bridge exposed by each CacheX server.
+It provides live node overview data, health/connection status, local key and
+memory metrics, replication-factor visibility, and GET/SET/DELETE operations.
+See [commands.md](commands.md) for startup instructions.
 
-```text
-Metrics Collection
-Workload Generator
-Performance Benchmarks
-Experimental Evaluation
-Monitoring Dashboard
-```
+The workload generator, benchmark suite, and full experimental evaluation
+remain future Phase 5 work.
 
 # Experimental Evaluation
 
