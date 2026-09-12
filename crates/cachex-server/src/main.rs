@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,40 @@ const DEFAULT_ADDR: &str = "127.0.0.1:7000";
 const DEFAULT_CAPACITY: usize = 10_000;
 const DEFAULT_NODE_ID: &str = "node-1";
 const AOF_PATH: &str = "cachex.aof";
+
+type SharedHealth = Arc<Mutex<HashMap<String, NodeHealth>>>;
+type SharedManagedServers = Arc<Mutex<HashMap<String, ManagedServer>>>;
+
+struct ManagedServer {
+    child: Child,
+    address: String,
+    dashboard_address: String,
+}
+
+#[derive(Clone, Copy)]
+struct NodeHealth {
+    failures: u32,
+    state: NodeState,
+}
+
+#[derive(Clone, Copy)]
+enum NodeState {
+    Starting,
+    Healthy,
+    Suspect,
+    Dead,
+}
+
+impl NodeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Suspect => "suspect",
+            Self::Dead => "dead",
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,6 +106,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         partitioner,
         replication_factor,
     )?);
+    let health: SharedHealth = Arc::new(Mutex::new(
+        topology
+            .nodes()
+            .iter()
+            .map(|node| {
+                (
+                    node.id.clone(),
+                    NodeHealth {
+                        failures: 0,
+                        state: NodeState::Starting,
+                    },
+                )
+            })
+            .collect(),
+    ));
+    let managed_servers: SharedManagedServers = Arc::new(Mutex::new(HashMap::new()));
     let store: SharedStore = Arc::new(Mutex::new(Store::recover(
         &aof_path,
         capacity,
@@ -91,16 +142,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "1000",
     )
     .parse::<u64>()?;
-    spawn_heartbeat(Arc::clone(&topology), heartbeat_interval_ms);
+    spawn_heartbeat(
+        Arc::clone(&topology),
+        heartbeat_interval_ms,
+        Arc::clone(&health),
+    );
     println!("Dashboard API available at http://{}", dashboard_addr);
     let dashboard_store = Arc::clone(&store);
     let dashboard_topology = Arc::clone(&topology);
+    let dashboard_health = Arc::clone(&health);
+    let dashboard_managed_servers = Arc::clone(&managed_servers);
+    let dashboard_node_id = store.lock().await.node_id().to_string();
     tokio::spawn(async move {
         if let Err(error) = dashboard_loop(
             dashboard_listener,
             dashboard_store,
             dashboard_topology,
+            dashboard_health,
+            dashboard_managed_servers,
+            dashboard_node_id,
             replication_factor,
+            partitioner_name,
+            capacity,
+            aof_path,
         )
         .await
         {
@@ -109,11 +173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     loop {
         let (stream, peer) = listener.accept().await?;
-        println!("New connection from: {}", peer);
         let store = Arc::clone(&store);
         let topology = Arc::clone(&topology);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, store, topology, replication_factor).await {
+            if let Err(e) =
+                handle_connection(stream, peer, store, topology, replication_factor).await
+            {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -155,15 +220,37 @@ async fn dashboard_loop(
     listener: TcpListener,
     store: SharedStore,
     topology: Arc<ClusterClient>,
+    health: SharedHealth,
+    managed_servers: SharedManagedServers,
+    local_node_id: String,
     replication_factor: usize,
+    partitioner: String,
+    capacity: usize,
+    aof_path: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let store = Arc::clone(&store);
         let topology = Arc::clone(&topology);
+        let health = Arc::clone(&health);
+        let managed_servers = Arc::clone(&managed_servers);
+        let local_node_id = local_node_id.clone();
+        let partitioner = partitioner.clone();
+        let aof_path = aof_path.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_dashboard_request(stream, store, topology, replication_factor).await
+            if let Err(error) = handle_dashboard_request(
+                stream,
+                store,
+                topology,
+                health,
+                managed_servers,
+                local_node_id,
+                replication_factor,
+                partitioner,
+                capacity,
+                aof_path,
+            )
+            .await
             {
                 eprintln!("Dashboard request error: {error}");
             }
@@ -175,7 +262,13 @@ async fn handle_dashboard_request(
     mut stream: TcpStream,
     store: SharedStore,
     topology: Arc<ClusterClient>,
+    health: SharedHealth,
+    managed_servers: SharedManagedServers,
+    local_node_id: String,
     replication_factor: usize,
+    partitioner: String,
+    capacity: usize,
+    aof_path: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = read_http_request(&mut stream).await?;
     let mut lines = request.splitn(2, "\r\n");
@@ -200,10 +293,23 @@ async fn handle_dashboard_request(
         }
         ("GET", "/api/overview") => {
             let store = store.lock().await;
+            let health = health.lock().await;
             let nodes: Vec<_> = topology
                 .nodes()
                 .iter()
-                .map(|node| json!({"id": node.id, "address": node.address}))
+                .map(|node| {
+                    let node_health = health.get(&node.id).copied().unwrap_or(NodeHealth {
+                        failures: 0,
+                        state: NodeState::Starting,
+                    });
+                    json!({
+                        "id": node.id,
+                        "address": node.address,
+                        "status": node_health.state.as_str(),
+                        "failure_count": node_health.failures,
+                        "local": node.id == local_node_id,
+                    })
+                })
                 .collect();
             let overview = json!({
                 "node": {
@@ -214,7 +320,10 @@ async fn handle_dashboard_request(
                     "uptime_secs": store.uptime_secs()
                 },
                 "nodes": nodes,
-                "replication_factor": replication_factor
+                "replication_factor": replication_factor,
+                "partitioner": partitioner,
+                "capacity": capacity,
+                "aof_path": aof_path,
             });
             write_json_response(&mut stream, 200, &overview).await?;
         }
@@ -234,12 +343,203 @@ async fn handle_dashboard_request(
                     return Ok(());
                 }
             };
-            let response = execute(command, &store, &topology, replication_factor).await;
-            write_json_response(&mut stream, 200, &json!({"response": response})).await?;
+            let route = command_route(&command, &topology, replication_factor);
+            match topology.execute(command).await {
+                Ok(response) => {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({"response": response, "route": route}),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    write_json_response(
+                        &mut stream,
+                        503,
+                        &json!({"error": error.to_string(), "route": route}),
+                    )
+                    .await?;
+                }
+            }
         }
+        ("GET", "/api/servers") => {
+            let servers = managed_server_status(&managed_servers).await;
+            write_json_response(&mut stream, 200, &json!({"servers": servers})).await?;
+        }
+        ("POST", "/api/servers/start") => {
+            match start_managed_server(body, &managed_servers).await {
+                Ok(server) => {
+                    write_json_response(&mut stream, 201, &json!({"server": server})).await?
+                }
+                Err(error) => {
+                    write_json_response(&mut stream, 400, &json!({"error": error})).await?
+                }
+            }
+        }
+        ("POST", "/api/servers/stop") => match stop_managed_server(body, &managed_servers).await {
+            Ok(server) => write_json_response(&mut stream, 200, &json!({"server": server})).await?,
+            Err(error) => write_json_response(&mut stream, 400, &json!({"error": error})).await?,
+        },
         _ => write_json_response(&mut stream, 404, &json!({"error": "not found"})).await?,
     }
     Ok(())
+}
+
+async fn managed_server_status(servers: &SharedManagedServers) -> Vec<serde_json::Value> {
+    let mut servers = servers.lock().await;
+    servers.retain(|_, server| server.child.try_wait().ok().flatten().is_none());
+    servers
+        .iter()
+        .map(|(node_id, server)| {
+            json!({
+                "node_id": node_id,
+                "pid": server.child.id(),
+                "address": server.address,
+                "dashboard_address": server.dashboard_address,
+                "status": "running",
+            })
+        })
+        .collect()
+}
+
+async fn start_managed_server(
+    body: &str,
+    servers: &SharedManagedServers,
+) -> Result<serde_json::Value, String> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| error.to_string())?;
+    let node_id = required_text(&payload, "node_id")?.to_string();
+    let address = required_text(&payload, "address")?.to_string();
+    let dashboard_address = required_text(&payload, "dashboard_address")?.to_string();
+    let aof_path = required_text(&payload, "aof_path")?.to_string();
+    let nodes = required_text(&payload, "nodes")?;
+    let partitioner = payload
+        .get("partitioner")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("consistent");
+    if partitioner_from_env(partitioner).is_err() {
+        return Err("partitioner must be consistent or modulo".into());
+    }
+    let replication_factor = payload
+        .get("replication_factor")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 2);
+    let capacity = payload
+        .get("capacity")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_CAPACITY as u64);
+    let heartbeat_interval_ms = payload
+        .get("heartbeat_interval_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1000);
+
+    let parsed_nodes = parse_nodes(nodes).map_err(|error| error.to_string())?;
+    if !parsed_nodes
+        .iter()
+        .any(|node| node.id == node_id && node.address == address)
+    {
+        return Err("nodes must include the selected node_id and address".into());
+    }
+
+    let mut servers = servers.lock().await;
+    if servers.contains_key(&node_id) {
+        return Err(format!("managed server '{node_id}' is already running"));
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let child = ProcessCommand::new(executable)
+        .args([
+            "--node-id",
+            &node_id,
+            "--addr",
+            &address,
+            "--aof-path",
+            &aof_path,
+            "--dashboard-addr",
+            &dashboard_address,
+            "--nodes",
+            nodes,
+            "--partitioner",
+            partitioner,
+            "--replication-factor",
+            &replication_factor.to_string(),
+            "--capacity",
+            &capacity.to_string(),
+            "--heartbeat-interval-ms",
+            &heartbeat_interval_ms.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to start server: {error}"))?;
+    let pid = child.id();
+    servers.insert(
+        node_id.clone(),
+        ManagedServer {
+            child,
+            address: address.clone(),
+            dashboard_address: dashboard_address.clone(),
+        },
+    );
+    Ok(json!({
+        "node_id": node_id,
+        "pid": pid,
+        "address": address,
+        "dashboard_address": dashboard_address,
+        "status": "starting",
+    }))
+}
+
+async fn stop_managed_server(
+    body: &str,
+    servers: &SharedManagedServers,
+) -> Result<serde_json::Value, String> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| error.to_string())?;
+    let node_id = required_text(&payload, "node_id")?;
+    let mut servers = servers.lock().await;
+    let mut server = servers
+        .remove(node_id)
+        .ok_or_else(|| format!("managed server '{node_id}' was not found"))?;
+    server
+        .child
+        .kill()
+        .map_err(|error| format!("failed to stop server '{node_id}': {error}"))?;
+    let _ = server.child.wait();
+    Ok(json!({"node_id": node_id, "status": "stopped"}))
+}
+
+fn required_text<'a>(payload: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{field} is required"))
+}
+
+fn command_route(
+    command: &Command,
+    topology: &ClusterClient,
+    replication_factor: usize,
+) -> serde_json::Value {
+    let Some(key) = (match command {
+        Command::Get { key } | Command::Set { key, .. } | Command::Delete { key } => Some(key),
+        _ => None,
+    }) else {
+        return json!({});
+    };
+    let replicas = topology
+        .replica_nodes_for_key(key, replication_factor)
+        .iter()
+        .map(|node| json!({"id": node.id, "address": node.address}))
+        .collect::<Vec<_>>();
+    json!({
+        "key": key,
+        "primary": replicas.first().cloned().unwrap_or_else(|| json!(null)),
+        "replicas": replicas,
+    })
 }
 
 fn dashboard_command(payload: &serde_json::Value) -> Result<Command, String> {
@@ -343,14 +643,9 @@ async fn write_http_response(
     Ok(())
 }
 
-fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64) {
+fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64, health: SharedHealth) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-        let mut health: HashMap<String, (u32, u8)> = topology
-            .nodes()
-            .iter()
-            .map(|n| (n.id.clone(), (0, 0)))
-            .collect();
         loop {
             ticker.tick().await;
             for node in topology.nodes() {
@@ -365,22 +660,34 @@ fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64) {
                     Ok::<(), std::io::Error>(())
                 })
                 .await;
-                let entry = health.entry(node.id.clone()).or_insert((0, 0));
                 if result.is_err() {
-                    entry.0 += 1;
-                    if entry.0 == 1 {
-                        entry.1 = 1;
+                    let mut health = health.lock().await;
+                    let entry = health.entry(node.id.clone()).or_insert(NodeHealth {
+                        failures: 0,
+                        state: NodeState::Starting,
+                    });
+                    entry.failures += 1;
+                    if entry.failures == 1 {
+                        entry.state = NodeState::Suspect;
                         eprintln!("heartbeat: node {} SUSPECT", node.id);
                     }
-                    if entry.0 >= 3 && entry.1 != 2 {
-                        entry.1 = 2;
+                    if entry.failures >= 3 && !matches!(entry.state, NodeState::Dead) {
+                        entry.state = NodeState::Dead;
                         eprintln!("heartbeat: node {} DEAD", node.id);
                     }
                 } else {
-                    if entry.1 != 0 {
+                    let mut health = health.lock().await;
+                    let entry = health.entry(node.id.clone()).or_insert(NodeHealth {
+                        failures: 0,
+                        state: NodeState::Starting,
+                    });
+                    if !matches!(entry.state, NodeState::Starting | NodeState::Healthy) {
                         eprintln!("heartbeat: node {} RECOVERED", node.id);
                     }
-                    *entry = (0, 0);
+                    *entry = NodeHealth {
+                        failures: 0,
+                        state: NodeState::Healthy,
+                    };
                 }
             }
         }
@@ -389,6 +696,7 @@ fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64) {
 
 async fn handle_connection(
     mut stream: TcpStream,
+    peer: SocketAddr,
     store: SharedStore,
     topology: Arc<ClusterClient>,
     replication_factor: usize,
@@ -404,10 +712,29 @@ async fn handle_connection(
             }
             Err(e) => return Err(e),
         };
+        if !matches!(
+            command,
+            Command::Heartbeat | Command::ReplicateSet { .. } | Command::ReplicateDelete { .. }
+        ) {
+            println!("Client command from {}: {}", peer, command_name(&command));
+        }
         let response = execute(command, &store, &topology, replication_factor).await;
         write_framed(&mut stream, &response).await?;
     }
     Ok(())
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Get { .. } => "GET",
+        Command::Set { .. } => "SET",
+        Command::Delete { .. } => "DELETE",
+        Command::Ping => "PING",
+        Command::Info => "INFO",
+        Command::ReplicateSet { .. } => "REPLICATE_SET",
+        Command::ReplicateDelete { .. } => "REPLICATE_DELETE",
+        Command::Heartbeat => "HEARTBEAT",
+    }
 }
 
 async fn execute(
@@ -423,6 +750,7 @@ async fn execute(
             value,
             ttl_secs,
         } => {
+            let local_node_id = store.lock().await.node_id().to_string();
             store.lock().await.set(
                 key.clone(),
                 value.clone(),
@@ -432,6 +760,7 @@ async fn execute(
                 topology,
                 &key,
                 replication_factor,
+                &local_node_id,
                 Command::ReplicateSet {
                     key: key.clone(),
                     value,
@@ -442,11 +771,13 @@ async fn execute(
             Response::Ok
         }
         Command::Delete { key } => {
+            let local_node_id = store.lock().await.node_id().to_string();
             if store.lock().await.delete(&key) {
                 replicate(
                     topology,
                     &key,
                     replication_factor,
+                    &local_node_id,
                     Command::ReplicateDelete { key: key.clone() },
                 )
                 .await;
@@ -488,12 +819,13 @@ async fn replicate(
     topology: &ClusterClient,
     key: &str,
     replication_factor: usize,
+    local_node_id: &str,
     command: Command,
 ) {
     for node in topology
         .replica_nodes_for_key(key, replication_factor)
         .into_iter()
-        .skip(1)
+        .filter(|node| node.id != local_node_id)
     {
         let result = timeout(Duration::from_secs(2), async {
             let mut stream = TcpStream::connect(&node.address).await?;

@@ -106,6 +106,29 @@ Open `http://localhost:5173`. For the two-node commands above, enter
 The dashboard reads live overview data from the selected node and can issue
 GET, SET, and DELETE operations through `/api/command`.
 
+### Start node B from the dashboard
+
+The dashboard can supervise additional local `cachex-server` processes. Start
+one bootstrap node manually first, then open the dashboard's **Server manager**
+tab. The default form is ready for a second node; verify the addresses and
+click **Start node-b**.
+
+The manager starts the child with the equivalent configuration:
+
+```text
+node ID:              node-b
+cache address:        127.0.0.1:7002
+dashboard address:    127.0.0.1:7602
+AOF path:             node-b.aof
+cluster nodes:        node-a=127.0.0.1:7001,node-b=127.0.0.1:7002
+partitioner:          consistent
+replication factor:   2
+```
+
+The managed-process list shows its PID and addresses. Use **Stop** there to
+terminate a node started by that dashboard. This supervisor is intended for a
+local dashboard; do not expose the dashboard API to an untrusted network.
+
 ## Failure detection and rerouting
 
 While both servers are running, set a value:
