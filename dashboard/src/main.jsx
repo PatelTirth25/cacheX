@@ -23,6 +23,21 @@ const initialServerForm = {
   heartbeat_interval_ms: '1000',
 }
 
+const initialMetrics = {
+  requests: 0,
+  requests_per_sec: 0,
+  hit_rate: 0,
+  hits: 0,
+  misses: 0,
+  sets: 0,
+  deletes: 0,
+  evictions: 0,
+  keys: 0,
+  memory_bytes: 0,
+  uptime_secs: 0,
+  latency_us: { p50: 0, p95: 0, p99: 0 },
+}
+
 function formatBytes(bytes) {
   if (!bytes) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
@@ -48,6 +63,7 @@ function responseLabel(response) {
 
 function App() {
   const [apiBase, setApiBase] = useState(() => localStorage.getItem('cachex-api') || 'http://127.0.0.1:7600')
+  const [connectedEndpoint, setConnectedEndpoint] = useState(null)
   const [overview, setOverview] = useState(initialOverview)
   const [history, setHistory] = useState([])
   const [activeView, setActiveView] = useState('overview')
@@ -62,6 +78,9 @@ function App() {
   const [servers, setServers] = useState([])
   const [serverForm, setServerForm] = useState(initialServerForm)
   const [serverLoading, setServerLoading] = useState(false)
+  const [telemetry, setTelemetry] = useState(initialMetrics)
+  const [metricHistory, setMetricHistory] = useState([])
+  const [clusterMetrics, setClusterMetrics] = useState([])
 
   const fetchOverview = useCallback(async () => {
     setLoading(true)
@@ -70,9 +89,11 @@ function App() {
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       setOverview(await response.json())
       setConnected(true)
+      setConnectedEndpoint(apiBase.replace(/\/$/, ''))
       setLastUpdated(new Date())
     } catch (error) {
       setConnected(false)
+      setConnectedEndpoint(null)
       setResult(`Dashboard API unavailable: ${error.message}`)
     } finally {
       setLoading(false)
@@ -89,23 +110,51 @@ function App() {
     }
   }, [apiBase])
 
+  const fetchMetrics = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase.replace(/\/$/, '')}/api/metrics`)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const nextMetrics = await response.json()
+      setTelemetry(nextMetrics)
+      setMetricHistory((history) => [...history, { time: new Date(), ...nextMetrics }].slice(-60))
+    } catch {
+      // Overview connectivity owns the connection indicator; metrics can briefly lag.
+    }
+  }, [apiBase])
+
+  const fetchClusterMetrics = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBase.replace(/\/$/, '')}/api/cluster-metrics`)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      setClusterMetrics((await response.json()).nodes || [])
+    } catch {
+      setClusterMetrics([])
+    }
+  }, [apiBase])
+
   useEffect(() => {
     fetchOverview()
     fetchServers()
+    fetchMetrics()
+    fetchClusterMetrics()
     const timer = setInterval(fetchOverview, 5000)
     const serverTimer = setInterval(fetchServers, 3000)
+    const metricsTimer = setInterval(fetchMetrics, 1000)
+    const clusterMetricsTimer = setInterval(fetchClusterMetrics, 5000)
     return () => {
       clearInterval(timer)
       clearInterval(serverTimer)
+      clearInterval(metricsTimer)
+      clearInterval(clusterMetricsTimer)
     }
-  }, [fetchOverview, fetchServers])
+  }, [fetchOverview, fetchServers, fetchMetrics, fetchClusterMetrics])
 
   const metrics = useMemo(() => [
-    { label: 'Cluster health', value: connected ? 'Operational' : 'Offline', note: connected ? 'API responding' : 'Check server', tone: connected ? 'green' : 'red' },
-    { label: 'Known nodes', value: overview.nodes.length || '—', note: `${overview.partitioner} · RF ${overview.replication_factor}`, tone: 'blue' },
-    { label: 'Keys on node', value: overview.node.keys.toLocaleString(), note: 'Local store', tone: 'purple' },
-    { label: 'Memory footprint', value: formatBytes(overview.node.memory_bytes), note: `${formatUptime(overview.node.uptime_secs)} · cap ${overview.capacity.toLocaleString()}`, tone: 'orange' },
-  ], [connected, overview])
+    { label: 'Nodes', value: `${overview.nodes.filter((node) => node.status === 'healthy').length} / ${overview.nodes.length || '—'}`, note: overview.nodes.some((node) => node.status !== 'healthy') ? 'degraded' : 'all healthy', tone: overview.nodes.some((node) => node.status !== 'healthy') ? 'red' : 'green' },
+    { label: 'Requests/sec', value: telemetry.requests_per_sec.toFixed(1), note: `${telemetry.requests.toLocaleString()} total`, tone: 'blue' },
+    { label: 'Hit rate', value: `${telemetry.hit_rate.toFixed(1)}%`, note: `${telemetry.hits.toLocaleString()} hits · ${telemetry.misses.toLocaleString()} misses`, tone: 'purple' },
+    { label: 'P99 latency', value: `${telemetry.latency_us.p99.toLocaleString()} μs`, note: `P50 ${telemetry.latency_us.p50.toLocaleString()} μs`, tone: 'orange' },
+  ], [connected, overview, telemetry])
 
   async function runOperation(event) {
     event.preventDefault()
@@ -123,7 +172,7 @@ function App() {
       const data = await response.json()
       const label = data.response ? responseLabel(data.response) : data.error
       const route = data.route?.primary
-        ? `Primary ${data.route.primary.id}; replicas ${data.route.replicas.map((node) => node.id).join(', ')}`
+        ? `Hash owner ${data.route.primary.id}; replicas ${data.route.replicas.length ? data.route.replicas.map((node) => node.id).join(', ') : 'none'}`
         : ''
       const displayResult = route ? `${label} · ${route}` : label
       setResult(displayResult)
@@ -138,6 +187,16 @@ function App() {
     event.preventDefault()
     localStorage.setItem('cachex-api', apiBase)
     fetchOverview()
+  }
+
+  function updateEndpoint(event) {
+    const nextEndpoint = event.target.value
+    setApiBase(nextEndpoint)
+    if (nextEndpoint.replace(/\/$/, '') !== connectedEndpoint) {
+      setConnected(false)
+      setMetricHistory([])
+      setClusterMetrics([])
+    }
   }
 
   function updateServerField(event) {
@@ -211,6 +270,8 @@ function App() {
         {activeView === 'overview' && <>
           <section className="hero-panel"><div><p className="kicker accent">REPLICATION MONITOR</p><h2>Keep every byte<br /><em>within reach.</em></h2><p className="hero-copy">A clear view of CacheX health, capacity, and node coordination.</p></div><div className="pulse-visual"><div className="pulse-ring ring-one"></div><div className="pulse-ring ring-two"></div><div className="pulse-core"><span>{overview.replication_factor}×</span><small>copies</small></div></div></section>
           <section className="metric-grid">{metrics.map((metric) => <article className="metric-card" key={metric.label}><div className={`metric-icon ${metric.tone}`}></div><p>{metric.label}</p><strong>{metric.value}</strong><span>{metric.note}</span></article>)}</section>
+          <section className="chart-grid"><ChartCard title="Throughput (req/sec)" color="#70a9ff" values={metricHistory.map((sample) => sample.requests_per_sec)} suffix=" req/s" /><ChartCard title="Cache hit ratio" color="#54d2ba" values={metricHistory.map((sample) => sample.hit_rate)} suffix="%" max={100} /><ChartCard title="GET latency (P50 / P95 / P99)" color="#ff8c70" values={metricHistory.map((sample) => sample.latency_us.p99)} suffix=" μs" /></section>
+          <NodeMetricsTable nodes={overview.nodes} localNode={overview.node} telemetry={telemetry} clusterMetrics={clusterMetrics} />
           <section className="panel activity-panel overview-activity"><div className="panel-heading"><div><p className="kicker">RECENT ACTIVITY</p><h3>Command trail</h3></div><span className="count-badge">{history.length}</span></div>{history.length === 0 ? <div className="empty-state"><span>✦</span><p>Your command history will appear here.</p></div> : <div className="activity-list">{history.map((item, index) => <div className="activity-row" key={`${item.time.toISOString()}-${index}`}><span className={`activity-method ${item.operation.toLowerCase()}`}>{item.operation}</span><span className="activity-key">{item.key}</span><span className="activity-result">{item.result}</span></div>)}</div>}</section>
         </>}
 
@@ -220,10 +281,28 @@ function App() {
 
         {activeView === 'servers' && <section className="panel full-panel"><div className="panel-heading"><div><p className="kicker">LOCAL SUPERVISOR</p><h3>Start a CacheX server</h3></div><span className="live-pill"><span className="status-dot live"></span>{servers.length} managed</span></div><p className="section-copy">Start a second node from this dashboard. The running dashboard server launches and supervises the child process locally.</p><form className="server-form" onSubmit={startServer}><div className="server-form-grid"><label>Node ID<input name="node_id" value={serverForm.node_id} onChange={updateServerField} placeholder="node-b" /></label><label>Cache address<input name="address" value={serverForm.address} onChange={updateServerField} placeholder="127.0.0.1:7002" /></label><label>Dashboard address<input name="dashboard_address" value={serverForm.dashboard_address} onChange={updateServerField} placeholder="127.0.0.1:7602" /></label><label>AOF path<input name="aof_path" value={serverForm.aof_path} onChange={updateServerField} placeholder="node-b.aof" /></label><label className="server-form-wide">Cluster nodes<input name="nodes" value={serverForm.nodes} onChange={updateServerField} placeholder="node-a=127.0.0.1:7001,node-b=127.0.0.1:7002" /></label><label>Partitioner<select name="partitioner" value={serverForm.partitioner} onChange={updateServerField}><option value="consistent">Consistent hashing</option><option value="modulo">Modulo</option></select></label><label>Replication factor<input name="replication_factor" type="number" min="1" max="2" value={serverForm.replication_factor} onChange={updateServerField} /></label><label>Capacity<input name="capacity" type="number" min="1" value={serverForm.capacity} onChange={updateServerField} /></label><label>Heartbeat interval (ms)<input name="heartbeat_interval_ms" type="number" min="100" value={serverForm.heartbeat_interval_ms} onChange={updateServerField} /></label></div><button className="primary-button" disabled={serverLoading}>{serverLoading ? 'Starting…' : `Start ${serverForm.node_id || 'server'}`}</button>{result && activeView === 'servers' && <div className={result.includes('failed') ? 'result-box error' : 'result-box'}>{result}</div>}</form><div className="managed-server-list"><div className="panel-heading"><div><p className="kicker">CHILD PROCESSES</p><h3>Managed servers</h3></div></div>{servers.length === 0 ? <div className="empty-state"><span>＋</span><p>No child servers are managed by this dashboard yet.</p></div> : servers.map((server) => <div className="managed-server-row" key={server.node_id}><div><strong>{server.node_id}</strong><span className="mono">{server.address} · dashboard {server.dashboard_address}</span></div><span className="node-status healthy"><span className="status-dot live"></span>{server.status} · PID {server.pid}</span><button className="danger-button" type="button" onClick={() => stopServer(server.node_id)}>Stop</button></div>)}</div></section>}
 
-        <section className="endpoint-bar"><div><span className="endpoint-label">DASHBOARD API</span><span className="endpoint-hint">Connect this view to any CacheX node</span></div><form onSubmit={saveEndpoint}><input value={apiBase} onChange={(event) => setApiBase(event.target.value)} aria-label="Dashboard API endpoint" /><button>Connect</button></form></section>
+        <section className="endpoint-bar"><div><span className="endpoint-label">DASHBOARD API</span><span className="endpoint-hint">{connected ? `Connected to ${connectedEndpoint}` : 'Connect this view to any CacheX node'}</span></div><form onSubmit={saveEndpoint}><input value={apiBase} onChange={updateEndpoint} aria-label="Dashboard API endpoint" /><button type="submit" disabled={connected && connectedEndpoint === apiBase.replace(/\/$/, '')}>{connected && connectedEndpoint === apiBase.replace(/\/$/, '') ? 'Connected' : 'Connect'}</button></form></section>
       </main>
     </div>
   )
+}
+
+function ChartCard({ title, color, values, suffix, max }) {
+  const width = 280
+  const height = 112
+  const chartValues = values.length ? values : [0]
+  const ceiling = max || Math.max(...chartValues, 1)
+  const points = chartValues.map((value, index) => {
+    const x = chartValues.length === 1 ? width / 2 : (index / (chartValues.length - 1)) * width
+    const y = height - Math.min(value / ceiling, 1) * (height - 10) - 5
+    return `${x},${y}`
+  }).join(' ')
+  const latest = chartValues[chartValues.length - 1]
+  return <section className="panel chart-card"><div className="chart-title"><span>{title}</span><strong>{latest.toFixed(latest < 10 ? 1 : 0)}{suffix}</strong></div><svg className="sparkline" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${title} chart`}><line x1="0" y1="25" x2={width} y2="25" /><line x1="0" y1="60" x2={width} y2="60" /><line x1="0" y1="95" x2={width} y2="95" /><polyline points={points} fill="none" stroke={color} strokeWidth="2" /></svg><div className="chart-axis"><span>−60s</span><span>now</span></div></section>
+}
+
+function NodeMetricsTable({ nodes, localNode, telemetry, clusterMetrics }) {
+  return <section className="panel node-metrics-panel"><div className="panel-heading"><div><p className="kicker">NODES</p><h3>Live cluster</h3></div><span className="live-pill"><span className="status-dot live"></span>{nodes.length} configured</span></div><div className="metrics-table"><div className="metrics-table-head"><span>Node</span><span>Status</span><span>Memory</span><span>Req/s</span><span>Hit rate</span><span>Keys</span><span>Evictions</span><span>Uptime</span></div>{nodes.map((node) => { const local = node.id === localNode.id; const row = clusterMetrics.find((item) => item.id === node.id); const nodeMetrics = local ? telemetry : row?.metrics; return <div className="metrics-table-row" key={node.id}><span className="mono">{node.address}</span><span className={`node-status ${node.status}`}><span className={`status-dot ${node.status === 'healthy' ? 'live' : ''}`}></span>{node.status}</span><span>{nodeMetrics ? formatBytes(nodeMetrics.memory_bytes) : '—'}</span><span>{nodeMetrics ? Number(nodeMetrics.requests_per_sec).toFixed(1) : '—'}</span><span>{nodeMetrics ? `${Number(nodeMetrics.hit_rate).toFixed(1)}%` : '—'}</span><span>{nodeMetrics ? Number(nodeMetrics.keys).toLocaleString() : '—'}</span><span>{nodeMetrics ? Number(nodeMetrics.evictions).toLocaleString() : '—'}</span><span>{nodeMetrics ? formatUptime(nodeMetrics.uptime_secs) : '—'}</span></div>})}</div></section>
 }
 
 function NodeTable({ nodes }) {

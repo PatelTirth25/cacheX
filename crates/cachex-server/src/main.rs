@@ -1,8 +1,11 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use cachex_client::{ClusterClient, Node, parse_nodes, partitioner_from_env};
 use cachex_protocol::{Command, Response, read_framed, write_framed};
@@ -20,6 +23,120 @@ const AOF_PATH: &str = "cachex.aof";
 
 type SharedHealth = Arc<Mutex<HashMap<String, NodeHealth>>>;
 type SharedManagedServers = Arc<Mutex<HashMap<String, ManagedServer>>>;
+type SharedMetrics = Arc<RuntimeMetrics>;
+
+struct RuntimeMetrics {
+    requests: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    sets: AtomicU64,
+    deletes: AtomicU64,
+    recent: StdMutex<VecDeque<(Instant, u64)>>,
+}
+
+impl RuntimeMetrics {
+    fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            sets: AtomicU64::new(0),
+            deletes: AtomicU64::new(0),
+            recent: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    fn record(&self, command: &Command, response: &Response, latency_us: u64) {
+        if matches!(
+            command,
+            Command::Heartbeat
+                | Command::Info
+                | Command::ReplicateSet { .. }
+                | Command::ReplicateDelete { .. }
+        ) {
+            return;
+        }
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        match command {
+            Command::Get { .. } => {
+                if matches!(response, Response::Value(Some(_))) {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                } else if matches!(response, Response::Value(None)) {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Command::Set { .. } => {
+                self.sets.fetch_add(1, Ordering::Relaxed);
+            }
+            Command::Delete { .. } => {
+                self.deletes.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let mut recent = lock_metrics(&self.recent);
+        let now = Instant::now();
+        recent.push_back((now, latency_us));
+        while recent
+            .front()
+            .is_some_and(|(timestamp, _)| now.duration_since(*timestamp) > Duration::from_secs(60))
+        {
+            recent.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> MetricSnapshot {
+        let now = Instant::now();
+        let mut recent = lock_metrics(&self.recent);
+        while recent
+            .front()
+            .is_some_and(|(timestamp, _)| now.duration_since(*timestamp) > Duration::from_secs(60))
+        {
+            recent.pop_front();
+        }
+        let mut latencies: Vec<u64> = recent.iter().map(|(_, latency)| *latency).collect();
+        latencies.sort_unstable();
+        let percentile = |percent: usize| -> u64 {
+            if latencies.is_empty() {
+                return 0;
+            }
+            let index = ((latencies.len() - 1) * percent / 100).min(latencies.len() - 1);
+            latencies[index]
+        };
+        let requests_last_10s = recent
+            .iter()
+            .filter(|(timestamp, _)| now.duration_since(*timestamp) <= Duration::from_secs(10))
+            .count() as u64;
+        MetricSnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            requests_per_sec: requests_last_10s as f64 / 10.0,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            sets: self.sets.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
+            p50_us: percentile(50),
+            p95_us: percentile(95),
+            p99_us: percentile(99),
+        }
+    }
+}
+
+struct MetricSnapshot {
+    requests: u64,
+    requests_per_sec: f64,
+    hits: u64,
+    misses: u64,
+    sets: u64,
+    deletes: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+}
+
+fn lock_metrics<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct ManagedServer {
     child: Child,
@@ -122,6 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
     ));
     let managed_servers: SharedManagedServers = Arc::new(Mutex::new(HashMap::new()));
+    let metrics: SharedMetrics = Arc::new(RuntimeMetrics::new());
     let store: SharedStore = Arc::new(Mutex::new(Store::recover(
         &aof_path,
         capacity,
@@ -152,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dashboard_topology = Arc::clone(&topology);
     let dashboard_health = Arc::clone(&health);
     let dashboard_managed_servers = Arc::clone(&managed_servers);
+    let dashboard_metrics = Arc::clone(&metrics);
     let dashboard_node_id = store.lock().await.node_id().to_string();
     tokio::spawn(async move {
         if let Err(error) = dashboard_loop(
@@ -160,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dashboard_topology,
             dashboard_health,
             dashboard_managed_servers,
+            dashboard_metrics,
             dashboard_node_id,
             replication_factor,
             partitioner_name,
@@ -175,9 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, peer) = listener.accept().await?;
         let store = Arc::clone(&store);
         let topology = Arc::clone(&topology);
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(stream, peer, store, topology, replication_factor).await
+                handle_connection(stream, peer, store, topology, metrics, replication_factor).await
             {
                 eprintln!("Connection error: {}", e);
             }
@@ -222,6 +343,7 @@ async fn dashboard_loop(
     topology: Arc<ClusterClient>,
     health: SharedHealth,
     managed_servers: SharedManagedServers,
+    metrics: SharedMetrics,
     local_node_id: String,
     replication_factor: usize,
     partitioner: String,
@@ -234,6 +356,7 @@ async fn dashboard_loop(
         let topology = Arc::clone(&topology);
         let health = Arc::clone(&health);
         let managed_servers = Arc::clone(&managed_servers);
+        let metrics = Arc::clone(&metrics);
         let local_node_id = local_node_id.clone();
         let partitioner = partitioner.clone();
         let aof_path = aof_path.clone();
@@ -244,6 +367,7 @@ async fn dashboard_loop(
                 topology,
                 health,
                 managed_servers,
+                metrics,
                 local_node_id,
                 replication_factor,
                 partitioner,
@@ -264,6 +388,7 @@ async fn handle_dashboard_request(
     topology: Arc<ClusterClient>,
     health: SharedHealth,
     managed_servers: SharedManagedServers,
+    metrics: SharedMetrics,
     local_node_id: String,
     replication_factor: usize,
     partitioner: String,
@@ -327,6 +452,15 @@ async fn handle_dashboard_request(
             });
             write_json_response(&mut stream, 200, &overview).await?;
         }
+        ("GET", "/api/metrics") => {
+            let store = store.lock().await;
+            let snapshot = metrics.snapshot();
+            write_json_response(&mut stream, 200, &metrics_payload(&store, snapshot)).await?;
+        }
+        ("GET", "/api/cluster-metrics") => {
+            let nodes = cluster_metrics(&topology, &health, &local_node_id, &store, &metrics).await;
+            write_json_response(&mut stream, 200, &json!({"nodes": nodes})).await?;
+        }
         ("POST", "/api/command") => {
             let payload: serde_json::Value = match serde_json::from_str(body) {
                 Ok(value) => value,
@@ -384,6 +518,87 @@ async fn handle_dashboard_request(
         _ => write_json_response(&mut stream, 404, &json!({"error": "not found"})).await?,
     }
     Ok(())
+}
+
+fn metrics_payload(store: &Store, snapshot: MetricSnapshot) -> serde_json::Value {
+    let total_gets = snapshot.hits + snapshot.misses;
+    let hit_rate = if total_gets == 0 {
+        0.0
+    } else {
+        snapshot.hits as f64 / total_gets as f64 * 100.0
+    };
+    json!({
+        "node": {"id": store.node_id(), "address": store.address()},
+        "requests": snapshot.requests,
+        "requests_per_sec": snapshot.requests_per_sec,
+        "hit_rate": hit_rate,
+        "hits": snapshot.hits,
+        "misses": snapshot.misses,
+        "sets": snapshot.sets,
+        "deletes": snapshot.deletes,
+        "evictions": store.evictions(),
+        "keys": store.keys(),
+        "memory_bytes": store.memory_bytes(),
+        "uptime_secs": store.uptime_secs(),
+        "latency_us": {
+            "p50": snapshot.p50_us,
+            "p95": snapshot.p95_us,
+            "p99": snapshot.p99_us,
+        }
+    })
+}
+
+async fn cluster_metrics(
+    topology: &ClusterClient,
+    health: &SharedHealth,
+    local_node_id: &str,
+    store: &SharedStore,
+    metrics: &SharedMetrics,
+) -> Vec<serde_json::Value> {
+    let health = health.lock().await.clone();
+    let local_store = store.lock().await;
+    let local_metrics = metrics_payload(&local_store, metrics.snapshot());
+    drop(local_store);
+    let mut nodes = Vec::with_capacity(topology.nodes().len());
+    for node in topology.nodes() {
+        let node_health = health.get(&node.id).copied().unwrap_or(NodeHealth {
+            failures: 0,
+            state: NodeState::Starting,
+        });
+        let node_metrics = if node.id == local_node_id {
+            Some(local_metrics.clone())
+        } else {
+            fetch_remote_metrics(&node.address).await
+        };
+        nodes.push(json!({
+            "id": node.id,
+            "address": node.address,
+            "status": node_health.state.as_str(),
+            "failure_count": node_health.failures,
+            "metrics": node_metrics,
+        }));
+    }
+    nodes
+}
+
+async fn fetch_remote_metrics(cache_address: &str) -> Option<serde_json::Value> {
+    let dashboard_address = default_dashboard_addr(cache_address);
+    let result = timeout(Duration::from_millis(500), async {
+        let mut stream = TcpStream::connect(dashboard_address).await?;
+        stream
+            .write_all(b"GET /api/metrics HTTP/1.1\r\nHost: cachex\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| &response[position + 4..])
+            .ok_or_else(|| std::io::Error::other("invalid metrics response"))?;
+        serde_json::from_slice(body).map_err(std::io::Error::other)
+    })
+    .await;
+    result.ok().and_then(Result::ok)
 }
 
 async fn managed_server_status(servers: &SharedManagedServers) -> Vec<serde_json::Value> {
@@ -535,10 +750,13 @@ fn command_route(
         .iter()
         .map(|node| json!({"id": node.id, "address": node.address}))
         .collect::<Vec<_>>();
+    let primary = replicas.first().cloned().unwrap_or_else(|| json!(null));
+    let replica_nodes = replicas.iter().skip(1).cloned().collect::<Vec<_>>();
     json!({
         "key": key,
-        "primary": replicas.first().cloned().unwrap_or_else(|| json!(null)),
-        "replicas": replicas,
+        "primary": primary,
+        "replicas": replica_nodes,
+        "placement": replicas,
     })
 }
 
@@ -649,18 +867,28 @@ fn spawn_heartbeat(topology: Arc<ClusterClient>, interval_ms: u64, health: Share
         loop {
             ticker.tick().await;
             for node in topology.nodes() {
+                let expected_node_id = node.id.clone();
                 let result = timeout(Duration::from_millis((interval_ms / 2).max(100)), async {
                     let mut stream = TcpStream::connect(&node.address).await?;
-                    write_framed(&mut stream, &Command::Heartbeat)
+                    write_framed(&mut stream, &Command::Info)
                         .await
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    let _: Response = read_framed(&mut stream)
+                    let response: Response = read_framed(&mut stream)
                         .await
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    Ok::<(), std::io::Error>(())
+                    match response {
+                        Response::Info { node_id, .. } if node_id == expected_node_id => Ok(()),
+                        Response::Info { node_id, .. } => Err(std::io::Error::other(format!(
+                            "expected node {}, received {}",
+                            expected_node_id, node_id
+                        ))),
+                        _ => Err(std::io::Error::other(
+                            "heartbeat returned an invalid response",
+                        )),
+                    }
                 })
                 .await;
-                if result.is_err() {
+                if !matches!(result, Ok(Ok(()))) {
                     let mut health = health.lock().await;
                     let entry = health.entry(node.id.clone()).or_insert(NodeHealth {
                         failures: 0,
@@ -699,6 +927,7 @@ async fn handle_connection(
     peer: SocketAddr,
     store: SharedStore,
     topology: Arc<ClusterClient>,
+    metrics: SharedMetrics,
     replication_factor: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -714,11 +943,21 @@ async fn handle_connection(
         };
         if !matches!(
             command,
-            Command::Heartbeat | Command::ReplicateSet { .. } | Command::ReplicateDelete { .. }
+            Command::Info
+                | Command::Heartbeat
+                | Command::ReplicateSet { .. }
+                | Command::ReplicateDelete { .. }
         ) {
             println!("Client command from {}: {}", peer, command_name(&command));
         }
+        let metric_command = command.clone();
+        let started = Instant::now();
         let response = execute(command, &store, &topology, replication_factor).await;
+        metrics.record(
+            &metric_command,
+            &response,
+            started.elapsed().as_micros() as u64,
+        );
         write_framed(&mut stream, &response).await?;
     }
     Ok(())

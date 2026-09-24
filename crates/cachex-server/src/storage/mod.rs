@@ -26,6 +26,7 @@ pub struct Store {
     node_id: String,
     address: String,
     start_time: Instant,
+    evictions: usize,
     aof: Option<Aof>,
 }
 
@@ -38,6 +39,7 @@ impl Store {
             node_id,
             address,
             start_time: Instant::now(),
+            evictions: 0,
             aof: None,
         }
     }
@@ -175,6 +177,10 @@ impl Store {
         self.start_time.elapsed().as_secs()
     }
 
+    pub fn evictions(&self) -> usize {
+        self.evictions
+    }
+
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
@@ -205,6 +211,7 @@ impl Store {
             match self.lru.pop_back() {
                 Some(key) => {
                     self.entries.remove(&key);
+                    self.evictions += 1;
                 }
                 None => break,
             }
